@@ -1022,77 +1022,120 @@ function targetExp(set){
   return tb[L];
 }
 const STATUS_BITS = { '': 0, slp: 3, psn: 8, brn: 16, frz: 32, par: 64, tox: 128 };
+function xorWords(dv, off, count, seed){ for(let i = 0; i < count; i++){ seed = (Math.imul(seed, 0x41C64E6D) + 0x6073) >>> 0; dv.setUint16(off + i * 2, (dv.getUint16(off + i * 2, true) ^ (seed >>> 16)) & 0xFFFF, true); } }
+// edit the 136-byte core of a stored Pokemon in place: EXP, held item, moves
+function editCore(dv, off, set){
+  const pid = dv.getUint32(off, true), ck = dv.getUint16(off + 6, true), words = prngWords(dv, off + 8, 64, ck);
+  const order = BLOCK_ORDER[((pid >>> 13) & 31) % 24], src = new Uint8Array(words.buffer), raw = new Uint8Array(128);
+  for(let i = 0; i < 4; i++) raw.set(src.subarray(i * 32, i * 32 + 32), 'ABCD'.indexOf(order[i]) * 32);
+  const r = new DataView(raw.buffer); let dirty = false;
+  const tx = targetExp(set);
+  if(r.getUint32(8, true) !== tx){ r.setUint32(8, tx, true); dirty = true; }
+  const itemId = set.item ? ITEM_ID[set.item] : 0;
+  if(itemId != null && r.getUint16(2, true) !== itemId){ r.setUint16(2, itemId, true); dirty = true; }
+  for(let k = 0; k < 4; k++){
+    const name = set.moves[k] || '', id = name ? MOVE_ID[name] : 0;
+    if(id == null) continue;
+    if(r.getUint16(0x20 + k * 2, true) !== id){ r.setUint16(0x20 + k * 2, id, true); raw[0x28 + k] = id ? Math.max(1, (MOVES[name] && MOVES[name].pp) || 10) : 0; raw[0x2C + k] = 0; dirty = true; }
+  }
+  if(!dirty) return;
+  const stored = new Uint8Array(128);
+  for(let i = 0; i < 4; i++) stored.set(raw.subarray('ABCD'.indexOf(order[i]) * 32, 'ABCD'.indexOf(order[i]) * 32 + 32), i * 32);
+  const sw = new DataView(stored.buffer); let sum = 0;
+  for(let i = 0; i < 64; i++) sum = (sum + sw.getUint16(i * 2, true)) & 0xFFFF;
+  dv.setUint16(off + 6, sum, true);
+  for(let i = 0; i < 64; i++) dv.setUint16(off + 8 + i * 2, sw.getUint16(i * 2, true), true);
+  xorWords(dv, off + 8, 64, sum);
+}
+// party-only data (status, level, HP, stats), encrypted with the PID
+function editParty(dv, off, set){
+  const pid = dv.getUint32(off, true);
+  xorWords(dv, off + 136, 42, pid);
+  const pk = mkPokemon(Object.assign({}, set, { boosts: {} }));
+  if(pk){
+    dv.setUint8(off + 136 + 4, Math.max(1, Math.min(100, +set.level || 1)));
+    [pk.maxHP(), pk.stats.atk, pk.stats.def, pk.stats.spe, pk.stats.spa, pk.stats.spd].forEach((v, k) => dv.setUint16(off + 136 + 8 + k * 2, v, true));
+  }
+  const max = dv.getUint16(off + 136 + 8, true);
+  const hp = set.dead ? 0 : (set.curHP == null ? max : Math.max(0, Math.min(max, set.curHP)));
+  dv.setUint16(off + 136 + 6, hp, true);
+  dv.setUint8(off + 136, hp === 0 ? 0 : (STATUS_BITS[set.status] || 0));
+  xorWords(dv, off + 136, 42, pid);
+}
+function blankPkm(len){ const b = new Uint8Array(len), d = new DataView(b.buffer); xorWords(d, 8, 64, 0); if(len > 136) xorWords(d, 136, 42, 0); return b; }
+const BOX_AT = (base, b, s) => base + 0x400 + b * 0x1000 + s * 136;
 function exportSave(){
   if(!SAVE_BUF) return { error: 'Import your .sav first' };
   const out = SAVE_BUF.slice(0), u8 = new Uint8Array(out), dv = new DataView(out);
-  let changed = 0;
+  const wantParty = S.party.filter(m => m._pid != null);
+  const skipped = S.party.length - wantParty.length;
+  if(!wantParty.length) return { error: 'Your party has no Pokemon from the save' };
+  let moved = 0;
   for(const base of [0, 0x24000]){
-    S.party.forEach(set => {
-      if(set._slot == null || set._pid == null) return;
-      const off = base + 0x18E08 + set._slot * 220;
-      if(dv.getUint32(off, true) !== set._pid) return;
-      // core data: held item and moves (encrypted with the PKM checksum, block order from the PID)
-      { const ck = dv.getUint16(off + 6, true), words = prngWords(dv, off + 8, 64, ck);
-        const order = BLOCK_ORDER[((set._pid >>> 13) & 31) % 24], src = new Uint8Array(words.buffer), raw = new Uint8Array(128);
-        for(let i = 0; i < 4; i++) raw.set(src.subarray(i * 32, i * 32 + 32), 'ABCD'.indexOf(order[i]) * 32);
-        const r = new DataView(raw.buffer); let dirty = false;
-        const tx = targetExp(set);
-        if(r.getUint32(8, true) !== tx){ r.setUint32(8, tx, true); dirty = true; }
-        const itemId = set.item ? ITEM_ID[set.item] : 0;
-        if(itemId != null && r.getUint16(2, true) !== itemId){ r.setUint16(2, itemId, true); dirty = true; }
-        for(let k = 0; k < 4; k++){
-          const name = set.moves[k] || '', id = name ? MOVE_ID[name] : 0;
-          if(id == null) continue;
-          if(r.getUint16(0x20 + k * 2, true) !== id){
-            r.setUint16(0x20 + k * 2, id, true);
-            raw[0x28 + k] = id ? Math.max(1, (MOVES[name] && MOVES[name].pp) || 10) : 0; raw[0x2C + k] = 0; dirty = true;
-          }
-        }
-        if(dirty){
-          const stored = new Uint8Array(128);
-          for(let i = 0; i < 4; i++) stored.set(raw.subarray('ABCD'.indexOf(order[i]) * 32, 'ABCD'.indexOf(order[i]) * 32 + 32), i * 32);
-          const sw = new DataView(stored.buffer); let sum = 0;
-          for(let i = 0; i < 64; i++) sum = (sum + sw.getUint16(i * 2, true)) & 0xFFFF;
-          dv.setUint16(off + 6, sum, true);
-          let seed = sum;
-          for(let i = 0; i < 64; i++){ seed = (Math.imul(seed, 0x41C64E6D) + 0x6073) >>> 0; dv.setUint16(off + 8 + i * 2, (sw.getUint16(i * 2, true) ^ (seed >>> 16)) & 0xFFFF, true); }
-        }
-      }
-      const ext = prngWords(dv, off + 136, 42, set._pid), e = new DataView(ext.buffer);
-      const pk = mkPokemon(Object.assign({}, set, { boosts: {} }));
-      if(pk){
-        e.setUint8(4, Math.max(1, Math.min(100, +set.level || 1)));
-        [pk.maxHP(), pk.stats.atk, pk.stats.def, pk.stats.spe, pk.stats.spa, pk.stats.spd].forEach((v, k) => e.setUint16(8 + k * 2, v, true));
-      }
-      const max = e.getUint16(8, true);
-      const hp = set.dead ? 0 : (set.curHP == null ? max : Math.max(0, Math.min(max, set.curHP)));
-      e.setUint16(6, hp, true);
-      e.setUint8(0, hp === 0 ? 0 : (STATUS_BITS[set.status] || 0));
-      // re-encrypt: the same keystream XOR turns plain words back into stored words
-      let seed = set._pid >>> 0;
-      for(let i = 0; i < 42; i++){ seed = (Math.imul(seed, 0x41C64E6D) + 0x6073) >>> 0; dv.setUint16(off + 136 + i * 2, (ext[i] ^ (seed >>> 16)) & 0xFFFF, true); }
-      if(base === 0) changed++;
+    // where every Pokemon in the save currently lives
+    const rec = {}, boxPid = [];
+    for(let i = 0; i < 6; i++){ const off = base + 0x18E08 + i * 220; if(decodePkm(dv, off, true)) rec[dv.getUint32(off, true)] = { core: u8.slice(off, off + 136), ext: u8.slice(off + 136, off + 220), from: 'party' }; }
+    for(let b = 0; b < 24; b++) for(let sl = 0; sl < 30; sl++){
+      const off = BOX_AT(base, b, sl);
+      if(decodePkm(dv, off, false)){ const pid = dv.getUint32(off, true); boxPid.push([b, sl, pid]); if(!rec[pid]) rec[pid] = { core: u8.slice(off, off + 136), ext: null, from: 'box' }; }
+    }
+    const party = wantParty.filter(m => rec[m._pid]);
+    if(!party.length) return { error: 'None of your party Pokemon were found in this save. Import your latest save and try again' };
+    const inParty = new Set(party.map(m => m._pid));
+    // box slots of Pokemon now in the party become empty
+    const blank136 = blankPkm(136);
+    boxPid.forEach(([b, sl, pid]) => { if(inParty.has(pid)){ u8.set(blank136, BOX_AT(base, b, sl)); if(base === 0) moved++; } });
+    // Pokemon that were in the party but are not anymore go to their box (graveyard box if dead)
+    const freeSlot = start => { for(let k = 0; k < 24; k++){ const b = (start + k) % 24; for(let sl = 0; sl < 30; sl++) if(!decodePkm(dv, BOX_AT(base, b, sl), false)) return [b, sl]; } return null; };
+    for(const [pid, r] of Object.entries(rec)){
+      if(r.from !== 'party' || inParty.has(+pid)) continue;
+      const set = S.box.find(m => m._pid === +pid);
+      const want = set && set.dead ? (S.graveBox || 24) : (set && set.boxNo) || 1;
+      const spot = freeSlot(want - 1);
+      if(!spot) return { error: 'Your boxes are full, so a Pokemon leaving the party has nowhere to go' };
+      u8.set(r.core, BOX_AT(base, spot[0], spot[1])); if(base === 0) moved++;
+    }
+    // rebuild the party in the calc's order
+    const blank220 = blankPkm(220);
+    for(let i = 0; i < 6; i++){
+      const off = base + 0x18E08 + i * 220, m = party[i];
+      if(!m){ u8.set(blank220, off); continue; }
+      const r = rec[m._pid];
+      u8.set(r.core, off);
+      if(r.ext) u8.set(r.ext, off + 136);
+      else { const e = new Uint8Array(84), ed = new DataView(e.buffer); xorWords(ed, 0, 42, m._pid >>> 0); u8.set(e, off + 136); }
+      editCore(dv, off, m); editParty(dv, off, m);
+    }
+    dv.setUint32(base + 0x18E04, party.length, true);
+    // box edits (moves, items, levels) for Pokemon still in the boxes
+    S.box.forEach(m => {
+      if(m._pid == null) return;
+      for(let b = 0; b < 24; b++) for(let sl = 0; sl < 30; sl++){ const off = BOX_AT(base, b, sl); if(dv.getUint32(off, true) === m._pid && decodePkm(dv, off, false)){ editCore(dv, off, m); return; } }
     });
-    // party block checksum, its copy in the checksum table, then the table's own checksum
+    // checksums: party block, every box block, then the checksum table
     const pc = crc16(u8, base + 0x18E00, 0x534);
     dv.setUint16(base + 0x19336, pc, true); dv.setUint16(base + 0x23F34, pc, true);
+    for(let b = 0; b < 24; b++){ const st = base + 0x400 + b * 0x1000, c = crc16(u8, st, 0xFF0); dv.setUint16(st + 0xFF2, c, true); dv.setUint16(base + 0x23F02 + b * 2, c, true); }
     dv.setUint16(base + 0x23F9A, crc16(u8, base + 0x23F00, 0x8C), true);
   }
   // verify by reading the new file back
   const back = parseSave(out);
   if(!back) return { error: 'Verification failed: the edited save could not be read back' };
-  for(const set of S.party){
-    if(set._slot == null) continue;
-    const b = back.party.find(x => x._pid === set._pid); if(!b) return { error: 'Verification failed for ' + (set.nick || set.species) };
-    if((set.item || '') !== (b.item || '') && ITEM_ID[set.item || ''] != null && set.item) return { error: 'Verification failed: item mismatch on ' + (set.nick || set.species) };
+  const sent = wantParty.filter(m => back.party.some(b => b._pid === m._pid));
+  if(back.party.map(b => b._pid).join() !== sent.map(m => m._pid).join()) return { error: 'Verification failed: party order did not match' };
+  for(const set of sent){
+    const b = back.party.find(x => x._pid === set._pid);
+    if(set.item && ITEM_ID[set.item] != null && set.item !== (b.item || '')) return { error: 'Verification failed: item mismatch on ' + (set.nick || set.species) };
     for(let k = 0; k < 4; k++){ const w = set.moves[k] || ''; if(w && MOVE_ID[w] != null && w !== (b.moves[k] || '')) return { error: 'Verification failed: move mismatch on ' + (set.nick || set.species) }; }
     if(b.level !== (+set.level || 1)) return { error: 'Verification failed: level mismatch on ' + (set.nick || set.species) };
     if(b._exp !== targetExp(set)) return { error: 'Verification failed: EXP mismatch on ' + (set.nick || set.species) };
     const want = set.dead ? 0 : set.curHP;
     if(!(want == null ? b.curHP == null : (b.curHP === want || (b.curHP == null && want >= maxHPof(b))))) return { error: 'Verification failed: HP mismatch on ' + (set.nick || set.species) };
   }
-  if(crc16(u8, 0x18E00, 0x534) !== dv.getUint16(0x19336, true)) return { error: 'Verification failed: checksum' };
-  return { buf: out, changed };
+  const total = (sv) => sv.party.length + sv.box.length, before = parseSave(SAVE_BUF);
+  if(before && total(before) !== total(back)) return { error: 'Verification failed: a Pokemon went missing' };
+  for(const base of [0, 0x24000]) if(crc16(u8, base + 0x18E00, 0x534) !== dv.getUint16(base + 0x19336, true)) return { error: 'Verification failed: checksum' };
+  return { buf: out, changed: sent.length, moved, skipped: skipped + (wantParty.length - sent.length) };
 }
 
 function toast(msg){ document.querySelectorAll('.toast').forEach(x => x.remove()); const el = document.createElement('div'); el.className = 'toast'; el.textContent = msg; document.body.appendChild(el); setTimeout(() => el.remove(), 3500); }
@@ -1456,7 +1499,7 @@ function render(){
 
   root.innerHTML = `
   <header class="top">
-    <div class="brand"><select id="game" class="gamesel" title="Switch game (each game keeps its own party, box, plans and save)"><option value="vw" ${GAME === 'vw' ? 'selected' : ''}>Vintage White</option><option value="plus" ${GAME === 'plus' ? 'selected' : ''}>Vintage White Plus</option></select> <small>Nuzlocke Calc &middot; v1.16</small></div>
+    <div class="brand"><select id="game" class="gamesel" title="Switch game (each game keeps its own party, box, plans and save)"><option value="vw" ${GAME === 'vw' ? 'selected' : ''}>Vintage White</option><option value="plus" ${GAME === 'plus' ? 'selected' : ''}>Vintage White Plus</option></select> <small>Nuzlocke Calc &middot; v1.17</small></div>
     <nav class="tabs"><button class="tab ${S.tab === 'calc' || !S.tab ? 'on' : ''}" data-tab="calc">Calculator</button><button class="tab ${S.tab === 'plan' ? 'on' : ''}" data-tab="plan">Plan${Object.keys(S.plans || {}).length ? ' <span class="cnt">' + Object.keys(S.plans).length + '</span>' : ''}</button><button class="tab ${S.tab === 'dex' ? 'on' : ''}" data-tab="dex">Dex</button></nav>
     <div class="settings">
       <label class="${HAS_POST ? '' : 'hidden'}">Part <select id="mode"><option value="main" ${S.mode === 'main' ? 'selected' : ''}>Main game</option><option value="post" ${S.mode === 'post' ? 'selected' : ''}>Post game</option></select></label>
@@ -1636,7 +1679,8 @@ document.addEventListener('click', e => {
     const name = SAVE_NAME.replace(/\.(sav|dsv)$/i, '') + '-edited.sav';
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([r.buf], { type: 'application/octet-stream' })); a.download = name;
     document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
-    toast(`Saved ${name}: HP, status, items, moves, levels and EXP for ${r.changed} party Pokemon`); return;
+    rememberSave(r.buf, SAVE_NAME);
+    toast(`Saved ${name}: party of ${r.changed} in your calc order${r.skipped ? ` (${r.skipped} added by hand could not be put in the game)` : ''}`); return;
   }
   if(b.dataset.tobox != null){
     const i = +b.dataset.tobox; if(S.party.length <= 1){ toast('Keep at least one Pokemon in the party'); return; }
