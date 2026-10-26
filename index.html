@@ -978,7 +978,7 @@ function decodePkm(dv, off, party){
   if(party){
     const ext = prngWords(dv, off + 136, 42, pid), e = new DataView(ext.buffer);
     const st = e.getUint8(0);
-    set.status = st & 7 ? 'slp' : st & 8 ? 'psn' : st & 16 ? 'brn' : st & 32 ? 'frz' : st & 64 ? 'par' : st & 128 ? 'tox' : '';
+    set.status = ({ 1: 'par', 2: 'slp', 3: 'frz', 4: 'brn', 5: 'psn' })[st] || '';
     if(e.getUint8(4)) set.level = e.getUint8(4);
     const cur = e.getUint16(6, true), max = e.getUint16(8, true);
     set.curHP = cur >= max ? null : cur;
@@ -1021,7 +1021,8 @@ function targetExp(set){
   if(set._exp != null && set._exp >= tb[L] && (L === 100 || set._exp < tb[L + 1])) return set._exp;
   return tb[L];
 }
-const STATUS_BITS = { '': 0, slp: 3, psn: 8, brn: 16, frz: 32, par: 64, tox: 128 };
+// Gen 5 stores party status as a single number, not the Gen 3/4 bit flags. Toxic becomes regular poison outside battle.
+const STATUS_BITS = { '': 0, par: 1, slp: 2, frz: 3, brn: 4, psn: 5, tox: 5 };
 function xorWords(dv, off, count, seed){ for(let i = 0; i < count; i++){ seed = (Math.imul(seed, 0x41C64E6D) + 0x6073) >>> 0; dv.setUint16(off + i * 2, (dv.getUint16(off + i * 2, true) ^ (seed >>> 16)) & 0xFFFF, true); } }
 // edit the 136-byte core of a stored Pokemon in place: EXP, held item, moves
 function editCore(dv, off, set){
@@ -1499,7 +1500,7 @@ function render(){
 
   root.innerHTML = `
   <header class="top">
-    <div class="brand"><select id="game" class="gamesel" title="Switch game (each game keeps its own party, box, plans and save)"><option value="vw" ${GAME === 'vw' ? 'selected' : ''}>Vintage White</option><option value="plus" ${GAME === 'plus' ? 'selected' : ''}>Vintage White Plus</option></select> <small>Nuzlocke Calc &middot; v1.17</small></div>
+    <div class="brand"><select id="game" class="gamesel" title="Switch game (each game keeps its own party, box, plans and save)"><option value="vw" ${GAME === 'vw' ? 'selected' : ''}>Vintage White</option><option value="plus" ${GAME === 'plus' ? 'selected' : ''}>Vintage White Plus</option></select> <small>Nuzlocke Calc &middot; v1.18</small></div>
     <nav class="tabs"><button class="tab ${S.tab === 'calc' || !S.tab ? 'on' : ''}" data-tab="calc">Calculator</button><button class="tab ${S.tab === 'plan' ? 'on' : ''}" data-tab="plan">Plan${Object.keys(S.plans || {}).length ? ' <span class="cnt">' + Object.keys(S.plans).length + '</span>' : ''}</button><button class="tab ${S.tab === 'dex' ? 'on' : ''}" data-tab="dex">Dex</button></nav>
     <div class="settings">
       <label class="${HAS_POST ? '' : 'hidden'}">Part <select id="mode"><option value="main" ${S.mode === 'main' ? 'selected' : ''}>Main game</option><option value="post" ${S.mode === 'post' ? 'selected' : ''}>Post game</option></select></label>
